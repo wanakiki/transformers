@@ -53,8 +53,8 @@ class LlamaRMSNorm(nn.Module):
         LlamaRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size)) # 只有这一个可学习参数
+        self.variance_epsilon = eps # 小常量，避免分母为1
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
@@ -139,8 +139,8 @@ class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.hidden_size = config.hidden_size   # 4096
+        self.intermediate_size = config.intermediate_size   # mlp 中间层的维度 11008
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
@@ -148,6 +148,10 @@ class LlamaMLP(nn.Module):
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        # gate_proj 和 up_proj 实现了将输入 x 从 hidden_size 映射到 intermediate_size 的维度 （升维）
+        # gate 作为门控路径，up 作为主路径，门控路径会经过激活函数 silu
+        # gate * up 是 element-wise，实现对 up 数据的控制
+        # 最终，down_proj 会将数据从 intermediate_size 映射回 hidden_size
         return down_proj
 
 
@@ -159,7 +163,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)   # 在第二个维度上扩展 n_rep 次
+    # 索引为 2 的位置插入一个新的维度，形状变为 batch, num_key_value_heads, 1, seqlen, head_dim
+    # expand 将插入维度扩展为 n_rep 次，形状变为 batch, num_key_value_heads, n_rep, seqlen, head_dim
+    # 这样就可以在 num_key_value_heads 的维度上重复 n_rep 次，n_rep 是 num_attention_heads / num_key_value_heads，对应 GQA 中复用次数
+    # 最终形状为 (batch, num_key_value_heads, n_rep, slen, head_dim)
+
+    # GQA 是 Grouped Query Attention 的缩写，Llama 模型中使用了 GQA 来降低计算成本
+    # 最终的结果是每个 key-value head 都会被重复 n_rep 次，形成 num_attention_heads 个 head
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -196,8 +207,8 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)   # 尝试查找配置中的 head_dim，如果没有则把 hidden_size 平均分配，这里可以通过设置更大的 head_dim 进行升维
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads    # 多少个 head 会共享一组 kv，Grouped Query Attention GQA，降低计算成本
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
@@ -214,6 +225,11 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
+
+        # nn.Linear 线性层，完成对输入张量的最后一个维度进行变换
+        # q_proj 将输入张量的最后一个维度从 hidden_size 映射到 num_attention_heads * head_dim 的维度，给每个 head 生成一个 head_dim 维度的向量
+        # k_proj 和 v_proj 类似，但它们的输出维度是 num_key_value_heads * head_dim
+
 
     def forward(
         self,
@@ -266,6 +282,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
 
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
 
+        # 两个 norm 的维度都是 hidden_size
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -281,7 +298,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor]:
-        residual = hidden_states
+        residual = hidden_states    # 残差 避免梯度消失
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
         hidden_states, _ = self.self_attn(
