@@ -103,9 +103,9 @@ class LlamaRotaryEmbedding(nn.Module):
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    x1 = x[..., : x.shape[-1] // 2] # 前半部分
+    x2 = x[..., x.shape[-1] // 2 :] # 后半部分
+    return torch.cat((-x2, x1), dim=-1) # 将后半部分取反，前半部分不变，只操作最后一个维度
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -128,10 +128,14 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
+    # cos 原始维度 是 (batch_size, seq_len, head_dim)   TODO 位置编码怎么会与 head_dim 有关？   
+    cos = cos.unsqueeze(unsqueeze_dim)  # 在unsqueeze_dim维度上增加大小为1的新维度，方便广播
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
+    q_embed = (q * cos) + (rotate_half(q) * sin)    # 将 q 和 k 的每个元素与 cos 和 sin 相乘，然后相加
     k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    # (batch_size, 1, seq_len, head_dim) 与 (batch_size, num_attention_heads, seq_len, head_dim) 广播
+    # 实现对每个 attention head 的位置编码
     return q_embed, k_embed
 
 
@@ -188,14 +192,23 @@ def eager_attention_forward(
     value_states = repeat_kv(value, module.num_key_value_groups)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    # query 的形状是 (batch, num_attention_heads, seq_len, head_dim)
+    # key_states 的形状是 (batch, num_key_value_heads * num_key_value_groups, seq_len, head_dim)    通过复制实现了与 q 维度一致
+    # transpose(2, 3) 将 key_states 的最后两个维度交换，变为 (batch,num_attention_heads, head_dim, seq_len)
+    # 这样就可以计算注意力权重，attention weights 形状为 (batch, num_attention_heads, seq_len, seq_len)
+    # self.scaling = self.head_dim**-0.5
+
+
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        # 实际上是将 attention_mask 的最后一个维度裁剪到 key_states 的 seq_len
+        # TODO : 确认 causal_mask 的原始形状，为了避免关注未来，可能是一个上三角矩阵？
         attn_weights = attn_weights + causal_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype) # 在最后一个维度上进行 softmax，使其和为 1，important 这里进行了精度转换
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training) # TODO 如果在上层已经用了判断，为什么这里要再过一次 droupout？ 可能是为了兼容不同的实现方式
+    attn_output = torch.matmul(attn_weights, value_states)  # 计算注意力输出，形状为 (batch, num_attention_heads, seq_len, head_dim)
+    attn_output = attn_output.transpose(1, 2).contiguous()  # 交换维度为 (batch, seq_len, num_attention_heads, head_dim)，并保证其内存连续性
 
     return attn_output, attn_weights
 
@@ -207,7 +220,7 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)   # 尝试查找配置中的 head_dim，如果没有则把 hidden_size 平均分配，这里可以通过设置更大的 head_dim 进行升维
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)   # 尝试查找配置中的 head_dim，如果没有则把 hidden_size 根据头的个数（默认32）平均分配，这里可以通过设置更大的 head_dim 进行升维
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads    # 多少个 head 会共享一组 kv，Grouped Query Attention GQA，降低计算成本
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
@@ -240,12 +253,22 @@ class LlamaAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        
+        # 输入的维度是 (batch, seq_len, hidden_size)
+
+        input_shape = hidden_states.shape[:-1]  # 除了最后一个维度外的所有维度
+        hidden_shape = (*input_shape, -1, self.head_dim)    # 将最后一个维度进行拆分
+        # 这里的 -1 表示自动计算维度，head_dim 是每个头的维度
+        # 相当于将 hidden_states 的最后一个维度分成了 num_attention_heads 个 head，每个 head 的维度为 head_dim
+        # -1 被自动计算，对应到 num_attention_heads 
+        # 这里不直接使用 num_attention_heads，因为在 GQA 中，num_attention_heads 可能不是一个整数，而是 num_key_value_heads 的整数倍
 
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # view 将张量的形状转换为 hidden_shape，transpose 交换了维度
+        # query_states 的形状变为 (batch, num_attention_heads, seq_len, head_dim)，这样方便后续计算
+        # TODO : 确定 num_attention_heads 非整数的影响
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -254,6 +277,8 @@ class LlamaAttention(nn.Module):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+            # 这里直接缓存了 key_states 和 value_states 以及 position_embeddings
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -265,14 +290,18 @@ class LlamaAttention(nn.Module):
             key_states,
             value_states,
             attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
+            dropout=0.0 if not self.training else self.attention_dropout,   # 如果不是训练模式，则不使用 dropout
             scaling=self.scaling,
             **kwargs,
         )
 
+        # attn_output 的形状是 (batch, seq_len, num_attention_heads, head_dim)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        # transpose 之后再次进行 reshape，将 attn_output 的形状转换为 (batch, seq_len, num_attention_heads * head_dim)
+        # 相当于整合了 head 的信息，将每个 head 的输出拼接在一起
+
+        attn_output = self.o_proj(attn_output)  # 将输出的维度从 num_attention_heads * head_dim 映射回 hidden_size
+        return attn_output, attn_weights    # TODO forward 中的 attn_weights 没有后续使用
 
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
@@ -338,6 +367,8 @@ class LlamaPreTrainedModel(PreTrainedModel):
         "hidden_states": LlamaDecoderLayer,
         "attentions": LlamaAttention,
     }
+
+    # 这里相当于给 Transformers 的 PreTrainedModel 添加了一些 Llama 特有的配置和支持的方法
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -417,6 +448,7 @@ class LlamaModel(LlamaPreTrainedModel):
             position_ids=position_ids,
         )
 
+        # 进行位置编码
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
@@ -430,6 +462,8 @@ class LlamaModel(LlamaPreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+            # 这里 causal_mask 和 position_embeddings 是共享的
+        # 经过所有的 decoder layer 后，hidden_states 的形状是 (batch_size, seq_len, hidden_size)
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(

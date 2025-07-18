@@ -7,9 +7,12 @@ num_key_value_heads 影响了 k_proj v_proj 的输出尺寸
 
 
 
+
+
 group 决定了 kv attention 被复制的个数
 
 
+bias 是布尔值
 
 ## 问题
 
