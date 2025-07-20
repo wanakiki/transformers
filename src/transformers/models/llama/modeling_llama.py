@@ -63,10 +63,18 @@ class LlamaRMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
+        # calc: 
+        # data_type convert to float32
+        # batch * seq_len * hidden_size * pow2 + batch * seq_len * hidden_size * add + batch * seq_len * mul
+        # batch * seq_len * hidden_size * (add + rsqrt) + batch * seq_len * hidden_size * mul
+        # data type convert
+        # batch * seq_len * hidden_size * mul
+
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+# TODO 这个函数介绍了编码的生成方式
 class LlamaRotaryEmbedding(nn.Module):
     def __init__(self, config: LlamaConfig, device=None):
         super().__init__()
@@ -106,6 +114,9 @@ def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2] # 前半部分
     x2 = x[..., x.shape[-1] // 2 :] # 后半部分
     return torch.cat((-x2, x1), dim=-1) # 将后半部分取反，前半部分不变，只操作最后一个维度
+    
+    # calc:
+    # data reshape
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -138,6 +149,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     # 实现对每个 attention head 的位置编码
     return q_embed, k_embed
 
+    # calc:
+    # batch * num_attention_heads * seq_len * head_dim * (2 * add + 4 * mul)
+
 
 class LlamaMLP(nn.Module):
     def __init__(self, config):
@@ -145,6 +159,32 @@ class LlamaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size   # 4096
         self.intermediate_size = config.intermediate_size   # mlp 中间层的维度 11008
+        
+        # gate_proj 线性层计算量分析：
+        # 输入形状: (batch_size, seq_len, hidden_size)
+        # 输出形状: (batch_size, seq_len, intermediate_size)
+        # 权重矩阵: (hidden_size, intermediate_size)
+        # 
+        # 矩阵乘法规律：A(m×n) × B(n×o) = C(m×o)
+        # - 乘法次数: m × n × o
+        # - 加法次数: m × o × (n-1)
+        # 
+        # 对于 gate_proj，相当于：
+        # 输入矩阵: (batch_size×seq_len, hidden_size)  [m=batch_size×seq_len, n=hidden_size]
+        # 权重矩阵: (hidden_size, intermediate_size)    [n=hidden_size, o=intermediate_size]
+        # 输出矩阵: (batch_size×seq_len, intermediate_size) [m×o]
+        #
+        # 计算量：
+        # 乘法次数: (batch_size×seq_len) × hidden_size × intermediate_size
+        # 加法次数: (batch_size×seq_len) × intermediate_size × (hidden_size-1) (矩阵乘法累加)
+        #          + (batch_size×seq_len) × intermediate_size (如果有bias的话)
+        #
+        # 以Llama-7B为例 (hidden_size=4096, intermediate_size=11008):
+        # 乘法次数: batch_size × seq_len × 4096 × 11008 = batch_size × seq_len × 45,088,768
+        # 加法次数: batch_size × seq_len × 11008 × 4095 + batch_size × seq_len × 11008 (如果有bias)
+        #          = batch_size × seq_len × 45,077,760 + batch_size × seq_len × 11008
+        #          = batch_size × seq_len × 45,088,768 (有bias时)
+
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
@@ -158,6 +198,12 @@ class LlamaMLP(nn.Module):
         # 最终，down_proj 会将数据从 intermediate_size 映射回 hidden_size
         return down_proj
 
+        # calc:
+        # up_proj: batch * seq_len * hidden_size * intermediate_size * mul + batch * seq_len * intermediate_size * (hidden_size - 1) * add
+        # gate_proj: batch * seq_len * hidden_size * intermediate_size * mul + batch * seq_len * intermediate_size * (hidden_size - 1) * add
+        # act_fn: batch * seq_len * intermediate_size * silu
+        # *: batch * seq_len * intermediate_size * mul
+        # down_proj: batch * seq_len * intermediate_size * hidden_size * mul + batch * seq_len * hidden_size * (intermediate_size - 1) * add)
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -212,6 +258,11 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+    # calc:
+    # attn_weights: batch * num_attention_heads * seq_len * seq_len * mul + batch * num_attention_heads * seq_len * (seq_len - 1) * add + batch * num_attention_heads * seq_len * seq_len * mul
+    # mask: batch * num_attention_heads * seq_len * seq_len * add
+    # softmax: batch * num_attention_heads * seq_len * softmax(seq_len)
+    # attn_output: batch * num_attention_heads * seq_len * head_dim * mul + batch * num_attention_heads * head_dim * (seq_len - 1) * add
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -268,7 +319,7 @@ class LlamaAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         # view 将张量的形状转换为 hidden_shape，transpose 交换了维度
         # query_states 的形状变为 (batch, num_attention_heads, seq_len, head_dim)，这样方便后续计算
-        # TODO : 确定 num_attention_heads 非整数的影响
+        # TODO : 确定 num_attention_heads 非整数的影响,同时这里怎么应用缓存呢？
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
