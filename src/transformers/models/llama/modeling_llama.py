@@ -354,6 +354,13 @@ class LlamaAttention(nn.Module):
         attn_output = self.o_proj(attn_output)  # 将输出的维度从 num_attention_heads * head_dim 映射回 hidden_size
         return attn_output, attn_weights    # TODO forward 中的 attn_weights 没有后续使用
 
+        # calc:
+        # query_states: batch * seq_len * hidden_size * num_attention_heads * head_dim * mul + batch * seq_len * num_attention_heads * head_dim * (hidden_size - 1) * add
+        # key_states: batch * seq_len * hidden_size * num_key_value_heads * head_dim * mul + batch * seq_len * num_key_value_heads * head_dim * (hidden_size - 1) * add
+        # value_states: batch * seq_len * hidden_size * num_key_value_heads * head_dim * mul + batch * seq_len * num_key_value_heads * head_dim * (hidden_size - 1) * add
+        # apply_rotary_pos_emb: batch * num_attention_heads * seq_len * head_dim * (2 * add + 4 * mul)
+        # attn_weights: eager_attention_forward
+        # attn_output: batch * seq_len * num_attention_heads * head_dim * hidden_size * mul + batch * seq_len * hidden_size * (num_attention_heads * head_dim - 1) * add
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
@@ -399,6 +406,13 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
+    
+        # calc:
+        # input_layernorm: LlamaRMSNorm->forward(hidden_states)
+        # self_attn: LlamaAttention->forward(hidden_states, attention_mask, position_ids, past_key_value, use_cache, cache_position, position_embeddings)
+        # residual: 2 * batch * seq_len * hidden_size * add
+        # post_attention_layernorm: LlamaRMSNorm->forward(hidden_states)
+        # mlp: LlamaMLP->forward(hidden_states)
 
 
 @auto_docstring
