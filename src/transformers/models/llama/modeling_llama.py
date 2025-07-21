@@ -54,7 +54,9 @@ class LlamaRMSNorm(nn.Module):
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size)) # 只有这一个可学习参数
-        self.variance_epsilon = eps # 小常量，避免分母为1
+        self.variance_epsilon = eps # 小常量，避免分母为0
+
+        # 对一个 token 的所有 hidden_size 维度进行归一化
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
@@ -65,7 +67,7 @@ class LlamaRMSNorm(nn.Module):
 
         # calc: 
         # data_type convert to float32
-        # batch * seq_len * hidden_size * pow2 + batch * seq_len * hidden_size * add + batch * seq_len * mul
+        # batch * seq_len * hidden_size * pow2 + batch * seq_len * (hidden_size - 1) * add + batch * seq_len * mul
         # batch * seq_len * hidden_size * (add + rsqrt) + batch * seq_len * hidden_size * mul
         # data type convert
         # batch * seq_len * hidden_size * mul
