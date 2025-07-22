@@ -152,7 +152,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
     # calc:
-    # batch * num_attention_heads * seq_len * head_dim * (2 * add + 4 * mul)
+    # batch * num_attention_heads * seq_len * head_dim * (add + 2 * mul)
+    # batch * num_key_value_heads * seq_len * head_dim * (add + 2 * mul)
 
 
 class LlamaMLP(nn.Module):
@@ -321,6 +322,7 @@ class LlamaAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         # view 将张量的形状转换为 hidden_shape，transpose 交换了维度
         # query_states 的形状变为 (batch, num_attention_heads, seq_len, head_dim)，这样方便后续计算
+        # key_states value_states (batch, num_key_value_heads, seq_len, head_dim)
         # TODO : 确定 num_attention_heads 非整数的影响,同时这里怎么应用缓存呢？
 
         cos, sin = position_embeddings
@@ -360,7 +362,7 @@ class LlamaAttention(nn.Module):
         # query_states: batch * seq_len * hidden_size * num_attention_heads * head_dim * mul + batch * seq_len * num_attention_heads * head_dim * (hidden_size - 1) * add
         # key_states: batch * seq_len * hidden_size * num_key_value_heads * head_dim * mul + batch * seq_len * num_key_value_heads * head_dim * (hidden_size - 1) * add
         # value_states: batch * seq_len * hidden_size * num_key_value_heads * head_dim * mul + batch * seq_len * num_key_value_heads * head_dim * (hidden_size - 1) * add
-        # apply_rotary_pos_emb: batch * num_attention_heads * seq_len * head_dim * (2 * add + 4 * mul)
+        # apply_rotary_pos_emb: batch * seq_len * head_dim * (num_attention_heads + num_key_value_heads) * (add + 2 * mul)
         # attn_weights: eager_attention_forward
         # attn_output: batch * seq_len * num_attention_heads * head_dim * hidden_size * mul + batch * seq_len * hidden_size * (num_attention_heads * head_dim - 1) * add
 

@@ -22,7 +22,9 @@
 ### 2.2 apply_rotary_pos_emb 函数
 ```python
 # calc:
-# batch * num_attention_heads * seq_len * head_dim * (2 * add + 4 * mul)
+# 对 query: batch * num_attention_heads * seq_len * head_dim * (1 * add + 2 * mul)
+# 对 key: batch * num_key_value_heads * seq_len * head_dim * (1 * add + 2 * mul)
+# 总计: batch * seq_len * head_dim * (num_attention_heads + num_key_value_heads) * (1 * add + 2 * mul)
 ```
 
 ## 3. MLP 层计算量分析
@@ -54,12 +56,82 @@
 # query_states: batch * seq_len * hidden_size * num_attention_heads * head_dim * mul + batch * seq_len * num_attention_heads * head_dim * (hidden_size - 1) * add
 # key_states: batch * seq_len * hidden_size * num_key_value_heads * head_dim * mul + batch * seq_len * num_key_value_heads * head_dim * (hidden_size - 1) * add
 # value_states: batch * seq_len * hidden_size * num_key_value_heads * head_dim * mul + batch * seq_len * num_key_value_heads * head_dim * (hidden_size - 1) * add
-# apply_rotary_pos_emb: batch * num_attention_heads * seq_len * head_dim * (2 * add + 4 * mul)
+# apply_rotary_pos_emb: batch * seq_len * head_dim * (num_attention_heads + num_key_value_heads) * (1 * add + 2 * mul)
 # attn_weights: eager_attention_forward
 # attn_output: batch * seq_len * num_attention_heads * head_dim * hidden_size * mul + batch * seq_len * hidden_size * (num_attention_heads * head_dim - 1) * add
 ```
 
-## 5. Decoder Layer 完整计算量
+## 5. 各函数总计算量汇总
+
+### 5.1 LlamaRMSNorm 函数总计算量
+```python
+# 总计：
+# add: batch * seq_len * (hidden_size - 1 + hidden_size) = batch * seq_len * (2 * hidden_size - 1)
+# mul: batch * seq_len * (1 + hidden_size + hidden_size) = batch * seq_len * (2 * hidden_size + 1)
+# pow2: batch * seq_len * hidden_size
+# rsqrt: batch * seq_len * hidden_size
+```
+
+### 5.2 apply_rotary_pos_emb 函数总计算量
+```python
+# 总计：
+# add: batch * seq_len * head_dim * (num_attention_heads + num_key_value_heads) * 1
+# mul: batch * seq_len * head_dim * (num_attention_heads + num_key_value_heads) * 2
+```
+
+### 5.3 LlamaMLP 函数总计算量
+```python
+# 总计：
+# up_proj + gate_proj: 2 * (batch * seq_len * hidden_size * intermediate_size * mul + batch * seq_len * intermediate_size * (hidden_size - 1) * add)
+# element_wise_mul: batch * seq_len * intermediate_size * mul
+# down_proj: batch * seq_len * intermediate_size * hidden_size * mul + batch * seq_len * hidden_size * (intermediate_size - 1) * add
+
+# MLP 函数总计：
+# add: batch * seq_len * (2 * intermediate_size * (hidden_size - 1) + hidden_size * (intermediate_size - 1))
+#    = batch * seq_len * (3 * hidden_size * intermediate_size - 2 * intermediate_size - hidden_size)
+# mul: batch * seq_len * (2 * hidden_size * intermediate_size + intermediate_size + intermediate_size * hidden_size)
+#    = batch * seq_len * (3 * hidden_size * intermediate_size + intermediate_size)
+# silu: batch * seq_len * intermediate_size
+```
+
+### 5.4 eager_attention_forward 函数总计算量
+```python
+# 总计：
+# attn_weights 计算：batch * num_attention_heads * seq_len * seq_len * 2 * mul + batch * num_attention_heads * seq_len * (seq_len - 1) * add
+# mask 添加：batch * num_attention_heads * seq_len * seq_len * add
+# attn_output 计算：batch * num_attention_heads * seq_len * head_dim * mul + batch * num_attention_heads * head_dim * (seq_len - 1) * add
+
+# eager_attention_forward 总计：
+# add: batch * num_attention_heads * seq_len * (seq_len - 1 + seq_len + head_dim * (seq_len - 1))
+#    = batch * num_attention_heads * seq_len * (2 * seq_len - 1 + head_dim * (seq_len - 1))
+# mul: batch * num_attention_heads * seq_len * (2 * seq_len + head_dim)
+# softmax: batch * num_attention_heads * seq_len * softmax(seq_len)
+```
+
+### 5.5 LlamaAttention 函数总计算量
+```python
+# 总计：
+# QKV 投影：
+# - query: batch * seq_len * hidden_size * num_attention_heads * head_dim * mul + batch * seq_len * num_attention_heads * head_dim * (hidden_size - 1) * add
+# - key: batch * seq_len * hidden_size * num_key_value_heads * head_dim * mul + batch * seq_len * num_key_value_heads * head_dim * (hidden_size - 1) * add
+# - value: batch * seq_len * hidden_size * num_key_value_heads * head_dim * mul + batch * seq_len * num_key_value_heads * head_dim * (hidden_size - 1) * add
+# RoPE: batch * seq_len * head_dim * (num_attention_heads + num_key_value_heads) * (1 * add + 2 * mul)
+# attention 计算: eager_attention_forward 的计算量
+# output 投影: batch * seq_len * num_attention_heads * head_dim * hidden_size * mul + batch * seq_len * hidden_size * (num_attention_heads * head_dim - 1) * add
+
+# LlamaAttention 总计：
+# add: batch * seq_len * ((num_attention_heads + 2 * num_key_value_heads) * head_dim * (hidden_size - 1) + 
+#                         num_attention_heads * head_dim * 2 + 
+#                         hidden_size * (num_attention_heads * head_dim - 1)) +
+#      eager_attention_forward 的 add 计算量
+# mul: batch * seq_len * ((num_attention_heads + 2 * num_key_value_heads) * head_dim * hidden_size +
+#                         num_attention_heads * head_dim * 4 +
+#                         num_attention_heads * head_dim * hidden_size) +
+#      eager_attention_forward 的 mul 计算量
+# softmax: eager_attention_forward 的 softmax 计算量
+```
+
+## 6. Decoder Layer 完整计算量
 
 ```python
 # calc:
@@ -70,20 +142,20 @@
 # mlp: LlamaMLP->forward(hidden_states)
 ```
 
-## 6. 计算量汇总
+## 7. 计算量汇总
 
-### 6.1 各模块计算复杂度对比
+### 7.1 各模块计算复杂度对比
 - **MLP层**: 主导计算量，包含3个大型线性变换
 - **注意力层**: 次要计算量，包含4个线性变换 + 注意力计算
 - **归一化层**: 相对较小的计算量
 - **位置编码**: 最小的计算量
 
-### 6.2 优化要点
+### 7.2 优化要点
 - **KV Cache**: 将注意力计算从 O(seq_len²) 降为 O(seq_len)
 - **GQA**: 减少 key/value 投影的计算量
 - **矩阵乘法优化**: 是所有计算的核心，需要硬件加速
 
-## 7. 单个 Token 推理计算量分析
+## 8. 单个 Token 推理计算量分析
 
 ### 7.1 模型参数
 - hidden_size = 4096
@@ -137,8 +209,8 @@
 # value_states: 1 * 1 * 4096 * 8 * 128 * mul + 1 * 1 * 8 * 128 * (4096 - 1) * add
 #             = 4,194,304 * mul + 4,193,280 * add
 
-# apply_rotary_pos_emb: 1 * 32 * 1 * 128 * (2 * add + 4 * mul) 
-#                     = 8,192 * add + 16,384 * mul
+# apply_rotary_pos_emb: 1 * 1 * 128 * (32 + 8) * (1 * add + 2 * mul) 
+#                     = 5,120 * add + 10,240 * mul
 
 # 注意：对于单token推理，attn_weights 计算简化为：
 # attn_weights: 1 * 32 * 1 * past_seq_len * mul + 1 * 32 * (past_seq_len - 1) * add
@@ -153,22 +225,24 @@
 #       = 16,777,216 * mul + 16,773,119 * add
 
 # 注意力总计（不含序列长度相关项）：
-# 41,988,352 * mul + 41,932,791 * add + 32 * softmax(L) + 序列长度相关计算
+# mul: 16,777,216 + 4,194,304 + 4,194,304 + 10,240 + 16,777,216 = 41,953,280
+# add: 16,773,120 + 4,193,280 + 4,193,280 + 5,120 + 16,773,119 = 41,937,919
+# 41,953,280 * mul + 41,937,919 * add + 32 * softmax(L) + 序列长度相关计算
 ```
 
 ### 7.5 单个 Decoder Layer 总计算量
 ```python
 # calc (batch=1, seq_len=1):
 # input_layernorm: 8,191 * add + 8,192 * mul + 4,096 * pow2 + 4,096 * rsqrt
-# self_attn: 41,988,352 * mul + 41,932,791 * add + 32 * softmax(L) + 序列相关
+# self_attn: 41,953,280 * mul + 41,937,919 * add + 32 * softmax(L) + 序列相关
 # residual_1: 2 * 1 * 1 * 4096 * add = 8,192 * add
 # post_attention_layernorm: 8,191 * add + 8,192 * mul + 4,096 * pow2 + 4,096 * rsqrt  
 # mlp: 176,174,848 * mul + 176,128,000 * add + 14,336 * silu
 # residual_2: 8,192 * add
 
 # 单层总计：
-# add: 218,084,566 + 序列相关
-# mul: 218,171,392
+# add: 8,191 + 41,937,919 + 8,192 + 8,191 + 176,128,000 + 8,192 = 218,098,685 + 序列相关
+# mul: 8,192 + 41,953,280 + 8,192 + 176,174,848 = 218,144,512
 # silu: 14,336
 # pow2: 8,192
 # rsqrt: 8,192
@@ -178,8 +252,8 @@
 ### 7.6 完整模型推理（假设32层）
 ```python
 # 32层 Decoder Layer 总计：
-# add: 6,978,706,112 + 序列相关
-# mul: 6,981,484,544
+# add: 32 * 218,098,685 + 序列相关 = 6,979,157,920 + 序列相关
+# mul: 32 * 218,144,512 = 6,980,624,384
 # silu: 458,752
 # pow2: 262,144
 # rsqrt: 262,144
