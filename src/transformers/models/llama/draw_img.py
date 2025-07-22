@@ -1132,6 +1132,141 @@ def plot_incremental_vs_full_analysis(save_path: Optional[str] = None):
         print(f"{cache_len}\t\t{savings_percentages[i]:.1f}%\t\t{efficiency_multipliers[i]:.1f}x\t\t"
               f"{incremental_mlp_ratios[i]:.1f}%\t\t{incremental_attention_ratios[i]:.1f}%")
 
+def analyze_function_internal_operations(seq_len=1):
+    """分析每个函数内部各操作类型的详细分配"""
+    print(f"\n=== 各函数内部操作分配分析 (seq_len={seq_len}) ===")
+    
+    # 创建配置 - 使用 Llama 3 70B 配置  
+    config = ModelConfig(seq_len=seq_len)
+    weights = ComputeWeights()
+    analyzer = LlamaComputeAnalyzer(config, weights)
+    
+    print(f"模型配置: hidden_size={config.hidden_size}, num_layers={config.num_layers}, seq_len={config.seq_len}")
+    print(f"权重配置: Add={weights.add}, Mul={weights.mul}, SiLU={weights.silu}, Pow2={weights.pow2}, Rsqrt={weights.rsqrt}, Softmax={weights.softmax}")
+    print()
+    
+    # 1. RMSNorm 分析
+    rmsnorm_stats = analyzer.compute_rmsnorm()
+    print("1. RMSNorm 内部操作分配:")
+    print(f"   Add 操作:   {rmsnorm_stats['add']:>12,} 次")
+    print(f"   Mul 操作:   {rmsnorm_stats['mul']:>12,} 次")
+    print(f"   Pow2 操作:  {rmsnorm_stats['pow2']:>12,} 次")
+    print(f"   Rsqrt 操作: {rmsnorm_stats['rsqrt']:>12,} 次")
+    print(f"   总计算量:   {rmsnorm_stats['total']:>12.2e}")
+    print()
+    
+    # 2. RoPE 分析
+    rope_stats = analyzer.compute_rope()
+    print("2. RoPE 内部操作分配:")
+    print(f"   Add 操作:   {rope_stats['add']:>12,} 次")
+    print(f"   Mul 操作:   {rope_stats['mul']:>12,} 次")
+    print(f"   总计算量:   {rope_stats['total']:>12.2e}")
+    print()
+    
+    # 3. MLP 分析
+    mlp_stats = analyzer.compute_mlp()
+    print("3. MLP 内部操作分配:")
+    print(f"   Add 操作:   {mlp_stats['add']:>12,} 次")
+    print(f"   Mul 操作:   {mlp_stats['mul']:>12,} 次")
+    print(f"   SiLU 操作:  {mlp_stats['silu']:>12,} 次")
+    print(f"   总计算量:   {mlp_stats['total']:>12.2e}")
+    print()
+    
+    # 4. Attention Core 分析
+    attn_core_stats = analyzer.compute_attention_core()
+    print("4. Attention Core 内部操作分配:")
+    print(f"   Add 操作:    {attn_core_stats['add']:>12,} 次")
+    print(f"   Mul 操作:    {attn_core_stats['mul']:>12,} 次")
+    print(f"   Softmax 操作: {attn_core_stats['softmax']:>12,} 次")
+    print(f"   总计算量:    {attn_core_stats['total']:>12.2e}")
+    print()
+    
+    # 5. Full Attention 分析
+    full_attn_stats = analyzer.compute_attention()
+    print("5. Full Attention 内部操作分配:")
+    print(f"   Add 操作:    {full_attn_stats['add']:>12,} 次")
+    print(f"   Mul 操作:    {full_attn_stats['mul']:>12,} 次")
+    print(f"   Softmax 操作: {full_attn_stats['softmax']:>12,} 次")
+    print(f"   总计算量:    {full_attn_stats['total']:>12.2e}")
+    print()
+    
+    # 6. 单层 Decoder 总体分析
+    layer_stats = analyzer.compute_decoder_layer()
+    total_stats = layer_stats['total']
+    print("6. 单层 Decoder 总体操作分配:")
+    print(f"   Add 操作:    {total_stats['add']:>12,} 次")
+    print(f"   Mul 操作:    {total_stats['mul']:>12,} 次")
+    print(f"   SiLU 操作:   {total_stats['silu']:>12,} 次")
+    print(f"   Pow2 操作:   {total_stats['pow2']:>12,} 次")
+    print(f"   Rsqrt 操作:  {total_stats['rsqrt']:>12,} 次")
+    print(f"   Softmax 操作: {total_stats['softmax']:>12,} 次")
+    print(f"   总计算量:    {total_stats['total']:>12.2e}")
+    print()
+    
+    # 7. 操作类型占比分析
+    print("7. 单层 Decoder 操作类型占比:")
+    total_weighted = total_stats['total']
+    
+    operations = [
+        ('Add', total_stats['add'], weights.add),
+        ('Mul', total_stats['mul'], weights.mul),
+        ('SiLU', total_stats['silu'], weights.silu),
+        ('Pow2', total_stats['pow2'], weights.pow2),
+        ('Rsqrt', total_stats['rsqrt'], weights.rsqrt),
+        ('Softmax', total_stats['softmax'], weights.softmax)
+    ]
+    
+    for op_name, count, weight in operations:
+        weighted_value = count * weight
+        percentage = weighted_value / total_weighted * 100 if total_weighted > 0 else 0
+        print(f"   {op_name:<8}: {count:>12,} 次 × {weight:>4.1f} = {weighted_value:>12.2e} ({percentage:>5.1f}%)")
+    
+    print()
+    
+    # 8. 各函数操作数量对比表格
+    print("8. 各函数操作数量对比:")
+    print(f"{'函数名':<15} {'Add':<12} {'Mul':<12} {'SiLU':<12} {'Pow2':<12} {'Rsqrt':<12} {'Softmax':<12}")
+    print("-" * 90)
+    
+    functions_data = [
+        ('RMSNorm', rmsnorm_stats['add'], rmsnorm_stats['mul'], 0, rmsnorm_stats['pow2'], rmsnorm_stats['rsqrt'], 0),
+        ('RoPE', rope_stats['add'], rope_stats['mul'], 0, 0, 0, 0),
+        ('MLP', mlp_stats['add'], mlp_stats['mul'], mlp_stats['silu'], 0, 0, 0),
+        ('Attention Core', attn_core_stats['add'], attn_core_stats['mul'], 0, 0, 0, attn_core_stats['softmax']),
+        ('Full Attention', full_attn_stats['add'], full_attn_stats['mul'], 0, 0, 0, full_attn_stats['softmax'])
+    ]
+    
+    for func_name, add, mul, silu, pow2, rsqrt, softmax in functions_data:
+        print(f"{func_name:<15} {add:<12,} {mul:<12,} {silu:<12,} {pow2:<12,} {rsqrt:<12,} {softmax:<12,}")
+    
+    print()
+    
+    # 9. 计算量密集型操作分析
+    print("9. 计算量密集型操作分析:")
+    weighted_ops = []
+    for op_name, count, weight in operations:
+        if count > 0:
+            weighted_value = count * weight
+            weighted_ops.append((op_name, count, weight, weighted_value))
+    
+    # 按加权计算量排序
+    weighted_ops.sort(key=lambda x: x[3], reverse=True)
+    
+    print("   排名    操作类型     操作次数        权重    加权计算量      占比")
+    print("-" * 70)
+    for i, (op_name, count, weight, weighted_value) in enumerate(weighted_ops, 1):
+        percentage = weighted_value / total_weighted * 100
+        print(f"   {i:2d}      {op_name:<8} {count:>12,} × {weight:>4.1f} = {weighted_value:>12.2e} ({percentage:>5.1f}%)")
+    
+    return {
+        'rmsnorm': rmsnorm_stats,
+        'rope': rope_stats,
+        'mlp': mlp_stats,
+        'attention_core': attn_core_stats,
+        'full_attention': full_attn_stats,
+        'decoder_layer': total_stats
+    }
+
 # 在现有函数后面添加
 def main():
     """主函数：演示脚本功能"""
@@ -1245,3 +1380,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 50)
     # 增量推理可视化对比
     plot_incremental_vs_full_analysis()
+    
+    print("\n" + "=" * 50)
+    # 函数内部操作分配分析
+    print("🔍 函数内部操作分配分析...")
+    analyze_function_internal_operations(seq_len=1)
+    analyze_function_internal_operations(seq_len=1024)
