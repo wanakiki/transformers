@@ -72,6 +72,12 @@ class LlamaRMSNorm(nn.Module):
         # data type convert
         # batch * seq_len * hidden_size * mul
 
+        # memory access:
+        # read hidden_states: batch * seq_len * hidden_size
+        # read weight: hidden_size
+        # total read: batch * seq_len * hidden_size + hidden_size
+        # write output: batch * seq_len * hidden_size
+
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
@@ -120,6 +126,10 @@ def rotate_half(x):
     # calc:
     # data reshape
 
+    # memory access:
+    # read x: x.shape
+    # write output: x.shape
+
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
@@ -154,6 +164,16 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     # calc:
     # batch * num_attention_heads * seq_len * head_dim * (add + 2 * mul)
     # batch * num_key_value_heads * seq_len * head_dim * (add + 2 * mul)
+
+    # memory access:
+    # read q: batch * num_attention_heads * seq_len * head_dim
+    # read k: batch * num_key_value_heads * seq_len * head_dim
+    # read cos: batch * seq_len * head_dim
+    # read sin: batch * seq_len * head_dim
+    # total read: batch * seq_len * head_dim * (num_attention_heads + num_key_value_heads + 2)
+    # write q_embed: batch * num_attention_heads * seq_len * head_dim
+    # write k_embed: batch * num_key_value_heads * seq_len * head_dim
+    # total write: batch * seq_len * head_dim * (num_attention_heads + num_key_value_heads)
 
 
 class LlamaMLP(nn.Module):
@@ -207,6 +227,15 @@ class LlamaMLP(nn.Module):
         # act_fn: batch * seq_len * intermediate_size * silu
         # *: batch * seq_len * intermediate_size * mul
         # down_proj: batch * seq_len * intermediate_size * hidden_size * mul + batch * seq_len * hidden_size * (intermediate_size - 1) * add)
+
+        # memory access:
+        # read x: batch * seq_len * hidden_size
+        # read gate_proj.weight: hidden_size * intermediate_size
+        # read up_proj.weight: hidden_size * intermediate_size
+        # read down_proj.weight: intermediate_size * hidden_size
+        # total read: batch * seq_len * hidden_size + intermediate_size * (2 * hidden_size + hidden_size)
+        # write output: batch * seq_len * hidden_size
+
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -266,6 +295,16 @@ def eager_attention_forward(
     # mask: batch * num_attention_heads * seq_len * seq_len * add
     # softmax: batch * num_attention_heads * seq_len * softmax(seq_len)
     # attn_output: batch * num_attention_heads * seq_len * head_dim * mul + batch * num_attention_heads * head_dim * (seq_len - 1) * add
+
+    # memory access:
+    # read query: batch * num_attention_heads * seq_len * head_dim
+    # read key: batch * num_key_value_heads * seq_len * head_dim
+    # read value: batch * num_key_value_heads * seq_len * head_dim
+    # read attention_mask: batch * 1 * seq_len * seq_len
+    # total read: batch * seq_len * (num_attention_heads * head_dim + 2 * num_key_value_heads * head_dim + seq_len)
+    # write attn_weights: batch * num_attention_heads * seq_len * seq_len
+    # write attn_output: batch * num_attention_heads * seq_len * head_dim
+    # total write: batch * num_attention_heads * seq_len * (seq_len + head_dim)
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -366,6 +405,17 @@ class LlamaAttention(nn.Module):
         # attn_weights: eager_attention_forward
         # attn_output: batch * seq_len * num_attention_heads * head_dim * hidden_size * mul + batch * seq_len * hidden_size * (num_attention_heads * head_dim - 1) * add
 
+        # memory access:
+        # read hidden_states: batch * seq_len * hidden_size
+        # read position_embeddings: 2 * batch * seq_len * head_dim
+        # read attention_mask: batch * 1 * seq_len * seq_len
+        # read q_proj.weight: hidden_size * num_attention_heads * head_dim
+        # read k_proj.weight: hidden_size * num_key_value_heads * head_dim
+        # read v_proj.weight: hidden_size * num_key_value_heads * head_dim
+        # read o_proj.weight: num_attention_heads * head_dim * hidden_size
+        # total read: batch * seq_len * (hidden_size + 2 * head_dim + seq_len) + hidden_size * head_dim * (2 * num_attention_heads + 2 * num_key_value_heads)
+        # write attn_output: batch * seq_len * hidden_size
+
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
@@ -417,6 +467,16 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         # residual: 2 * batch * seq_len * hidden_size * add
         # post_attention_layernorm: LlamaRMSNorm->forward(hidden_states)
         # mlp: LlamaMLP->forward(hidden_states)
+
+        # memory access:
+        # read hidden_states: batch * seq_len * hidden_size
+        # read attention_mask: batch * 1 * seq_len * seq_len
+        # read position_embeddings: 2 * batch * seq_len * head_dim
+        # read self_attn weights: hidden_size * head_dim * (2 * num_attention_heads + 2 * num_key_value_heads)
+        # read mlp weights: intermediate_size * (2 * hidden_size + hidden_size)
+        # read norm weights: 2 * hidden_size
+        # total read: batch * seq_len * (hidden_size + seq_len + 2 * head_dim) + hidden_size * head_dim * (2 * num_attention_heads + 2 * num_key_value_heads) + intermediate_size * (3 * hidden_size) + 2 * hidden_size
+        # write hidden_states: batch * seq_len * hidden_size
 
 
 @auto_docstring
