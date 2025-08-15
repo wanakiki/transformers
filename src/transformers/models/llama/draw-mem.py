@@ -180,40 +180,43 @@ def plot_memory_access(mem_data, stage, seq_len, chart_type):
     write_gb = [v * bytes_per_element / (1024**3) for v in write_values]
 
     x = np.arange(len(labels))
-    width = 0.6
+    width = 0.5  # 减小柱子宽度，使其更疏朗
 
     # --- 创建图表 ---
-    fig, ax = plt.subplots(figsize=(18, 10))
+    # 调整图表尺寸，使其更高，更适合垂直条形图
+    fig, ax = plt.subplots(figsize=(16, 12))
     
     title_map = {
         'overall': 'Overall Component-wise Memory I/O',
         'attention_detail': 'Attention Block Memory I/O Breakdown'
     }
     
-    fig.suptitle(f'Llama3-70B Memory Access per Layer in {stage.capitalize()} Stage (SeqLen={seq_len}, FP16)', fontsize=20, y=0.98)
-    ax.set_title(title_map.get(chart_type, 'Memory I/O'), fontsize=16, pad=20)
+    # 增大标题字号
+    fig.suptitle(f'Llama3-70B Memory Access per Layer in {stage.capitalize()} Stage (SeqLen={seq_len}, FP16)', fontsize=22, y=0.97)
+    ax.set_title(title_map.get(chart_type, 'Memory I/O'), fontsize=18, pad=20)
 
     # 创建堆叠条形图
     rects1 = ax.bar(x, read_gb, width, label='Read', color='#4C72B0')
     rects2 = ax.bar(x, write_gb, width, bottom=read_gb, label='Write', color='#DD8452')
 
-    ax.set_ylabel('Memory Access (GB)', fontsize=14)
+    # 增大坐标轴和图例的字号
+    ax.set_ylabel('Memory Access (GB)', fontsize=16)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=12)
-    ax.legend(fontsize=12)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=14)
+    ax.legend(fontsize=14)
     ax.grid(axis='y', linestyle='--', alpha=0.7)
 
-    # 在条形图上添加总数标签
+    # 在条形图上添加总数标签，并增大字号
     max_height = max(r + w for r, w in zip(read_gb, write_gb)) if any(r + w > 0 for r, w in zip(read_gb, write_gb)) else 1.0
     for i, (r, w) in enumerate(zip(read_gb, write_gb)):
         total = r + w
         if total > 0:  # 为所有非零条形图添加标签
             # 如果数值很小，使用科学计数法，否则用浮点数
             label_text = f'{total:.4f}' if total >= 0.001 else f'{total:.2e}'
-            ax.text(i, total + max_height * 0.01, label_text, ha='center', va='bottom', fontsize=9)
+            ax.text(i, total + max_height * 0.015, label_text, ha='center', va='bottom', fontsize=11)
 
-
-    fig.tight_layout(rect=(0, 0.03, 1, 0.95))
+    # 调整布局以适应新的字体大小
+    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
     plt.savefig(f'memory_access_{stage}_seqlen_{seq_len}_{chart_type}_fp16.png', dpi=300)
     # plt.show() # 移除此行以避免阻塞
 
